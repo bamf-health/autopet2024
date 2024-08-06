@@ -7,11 +7,14 @@ from pathlib import Path
 import json
 import SimpleITK as sitk
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import VarianceThreshold, SelectKBest, f_classif
 from sklearn.metrics import classification_report, accuracy_score
 import glob
 from radiomics import featureextractor
 import skimage
+from tqdm.auto import tqdm
 
 
 class PETScanAnalysis:
@@ -155,23 +158,42 @@ class PETScanAnalysis:
 
     def save_pet_metric_combined(self):
         # List all files matching the pattern pet_metrics_*csv
-        file_pattern = "pet_metrics_*csv"
+        file_pattern = "radiomics/pet_metrics_*csv"
         csv_files = glob.glob(file_pattern)
 
         # Read the first CSV file to initialize the combined dataframe
         combined_df = pd.read_csv(csv_files[0])
+        organ_name = (csv_files[0].split("pet_metrics_")[-1]).split(".csv")[0]
 
+        # Get all columns except "Subject"
+        columns_except_subject = combined_df.columns.difference(["Subject"])
+        # Add prefix to these columns
+        combined_df.rename(
+            columns={col: f"{organ_name}_{col}" for col in columns_except_subject},
+            inplace=True,
+        )
         # Merge the rest of the CSV files into the combined dataframe based on the Subjects column
-        for file in csv_files[1:]:
+        for file in tqdm(
+            csv_files[1:21], total=len(csv_files[1:21]), desc="collecting csv files"
+        ):
             df = pd.read_csv(file)
-            existing_columns = set(combined_df.columns)
-            columns_to_merge = [
-                col
-                for col in df.columns
-                if col not in existing_columns or col == "Subject"
-            ]
-            df_to_merge = df[columns_to_merge]
-            combined_df = pd.merge(combined_df, df_to_merge, on="Subject", how="outer")
+            organ_name = (file.split("pet_metrics_")[-1]).split(".csv")[0]
+            # Get all columns except "Subject"
+            columns_except_subject = df.columns.difference(["Subject"])
+            # Add prefix to these columns
+            df.rename(
+                columns={col: f"{organ_name}_{col}" for col in columns_except_subject},
+                inplace=True,
+            )
+
+            # existing_columns = set(combined_df.columns)
+            # columns_to_merge = [
+            #     col
+            #     for col in df.columns
+            #     if col not in existing_columns or col == "Subject"
+            # ]
+            # df_to_merge = df[columns_to_merge]
+            combined_df = pd.merge(combined_df, df, on="Subject", how="outer")
         # Split the combined dataframe into two based on the Subjects column
         fdg_df = combined_df[combined_df["Subject"].str.startswith("fdg")]
         psma_df = combined_df[combined_df["Subject"].str.startswith("psma")]
@@ -180,61 +202,140 @@ class PETScanAnalysis:
         fdg_df.to_csv("pet_metrics_fdg.csv", index=False)
         psma_df.to_csv("pet_metrics_psma.csv", index=False)
 
-        print(f"Saved {len(fdg_df)} rows to 'pet_metrics_fdg.csv'")
-        print(f"Saved {len(psma_df)} rows to 'pet_metrics_psma.csv'")
+    def remove_correlated_features(self, df, threshold=0.9):
+        # Calculate correlation matrix
+        corr_matrix = df.corr().abs()
+
+        # Select upper triangle of the correlation matrix
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+        # Find features with correlation above the threshold
+        to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+
+        # Drop features
+        df = df.drop(columns=to_drop)
+        return df
+
+    def remove_non_informative_features(self, df):
+        # Remove features with low variance
+        selector = VarianceThreshold()
+        df = df[df.columns[selector.fit(df).get_support()]]
+        return df
+
+    def feature_selection(self, X, y):
+        # Use SelectKBest for feature selection
+        selector = SelectKBest(score_func=f_classif, k="all")
+        selector.fit(X, y)
+        scores = pd.Series(selector.scores_, index=X.columns)
+        top_features = scores.nlargest(10).index
+        return top_features
 
     def run_classification(self, label_type):
-        if label_type == "fdg":
+        if Path(f"pet_metrics_{label_type}.csv").exists():
+            label_file = f"pet_metrics_{label_type}.csv"
+            print("file exists")
+        elif label_type == "fdg":
             label_file = "pet_metrics_fdg.csv"
+            df = pd.read_csv(label_file)
+            cols_to_remove = [
+                col for col in df.columns if col.startswith("Health_Status")
+            ]
+            df = df.drop(columns=cols_to_remove)
+            df.to_csv(label_file)
         elif label_type == "psma":
             label_file = "pet_metrics_psma.csv"
+            df = pd.read_csv(label_file)
+            cols_to_remove = [
+                col for col in df.columns if col.startswith("Health_Status")
+            ]
+            df = df.drop(columns=cols_to_remove)
+            df.to_csv(label_file)
+
         else:  # Both
             fdg_df = pd.read_csv("pet_metrics_fdg.csv")
             psma_df = pd.read_csv("pet_metrics_psma.csv")
             df = pd.concat([fdg_df, psma_df], ignore_index=True)
-            df.to_csv("pet_metrics_both.csv")
+            # Remove columns that start with 'Health_Status'
+            cols_to_remove = [
+                col for col in df.columns if col.startswith("Health_Status")
+            ]
+            df = df.drop(columns=cols_to_remove)
+            df.to_csv("pet_metrics_both.csv", index=False)
             label_file = "pet_metrics_both.csv"
+
         if Path(label_file).exists():
             result_df = pd.read_csv(label_file)
+            print(f" Final df : {len(result_df)}")
+            result_df["Subject"] = result_df["Subject"].apply(
+                lambda x: x.split("_00")[0] + ".nii.gz"
+            )
+            result_df = result_df.drop(columns="Health_Status")
+            hs = pd.read_csv("healthy_tumor_patients_report.csv")
+            hs.rename(columns={"Tumors_Present": "Health_Status"}, inplace=True)
+            print(f" Health df : {len(result_df)}")
+            result_df = pd.merge(result_df, hs, on="Subject")
+            print(f" Merged df : {len(result_df)}")
         else:
             st.error(f"CSV file for {label_type} classification does not exist.")
             return
 
-        feature_columns = [
-            col
-            for col in result_df.columns
-            if col.startswith("Mean_SUV")
-            or col.startswith("Volume")
-            or "pyradiomics" in col
-        ]
-        X = result_df[feature_columns].values
-        y = result_df["Health_Status"].values
+        # Drop non-feature columns
+        X = result_df.drop(columns=["Health_Status", "Subject"])
+        y = result_df["Health_Status"]
+        print(len(X))
+        st.write("Perfromaing feature selection")
+        # Feature Selection
+        # X = self.remove_non_informative_features(X)
+        # X = self.remove_correlated_features(X)
 
+        top_features = self.feature_selection(X, y)
+        X = X[top_features]
+
+        # Train-test split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.3, random_state=42
         )
-        clf = RandomForestClassifier()
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
+        st.write("Perfroming Classification")
+        # Initialize classifiers
+        classifiers = {
+            "Random Forest": RandomForestClassifier(n_estimators=10),
+            # "Logistic Regression": LogisticRegression(max_iter=1000),
+            # "Extra Trees": ExtraTreesClassifier(n_estimators=10),
+        }
 
-        accuracy = accuracy_score(y_test, y_pred)
-        report = classification_report(y_test, y_pred)
+        # Compare classifiers
+        results = {}
+        for name, clf in classifiers.items():
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+            accuracy = accuracy_score(y_test, y_pred)
+            report = classification_report(y_test, y_pred)
+            results[name] = {"accuracy": accuracy, "report": report}
 
-        st.write(f"Classification Report for {label_type}:")
-        st.text(report)
-        st.write(f"Accuracy: {accuracy:.2f}")
-        feature_importances = clf.feature_importances_
-        feature_names = feature_columns
-        feature_importance_dict = dict(zip(feature_names, feature_importances))
-        top_features = sorted(
-            feature_importance_dict.items(), key=lambda x: x[1], reverse=True
-        )[:3]
-        st.write(f"Top 3 Important Features for {label_type}:")
-        for feature, importance in top_features:
-            st.write(f"{feature}: {importance:.4f}")
+        # Display results
+        for name, result in results.items():
+            st.write(f"{name} Classification Report:")
+            st.text(result["report"])
+            st.write(f"{name} Accuracy: {result['accuracy']:.2f}")
+
+        # Plot the distribution of top features
+        self.plot_feature_distribution(result_df, top_features, label_type)
+
+    def plot_feature_distribution(self, df, top_features, label_type):
+        # Plot distribution of top features
+        for feature in top_features:
+            plt.figure(figsize=(10, 6))
+            sns.histplot(
+                df[feature], kde=True, hue=df["Health_Status"], palette="viridis"
+            )
+            plt.title(f"Distribution of {feature} for {label_type}")
+            plt.xlabel(feature)
+            plt.ylabel("Frequency")
+            plt.legend(title="Health Status")
+            plt.show()
 
     def run_app(self):
-        st.title("PET Scan Analysis")
+        st.title("PET Radiomics Analysis")
 
         st.markdown(
             """
@@ -275,9 +376,10 @@ class PETScanAnalysis:
                 )
                 st.write(f"Metrics for {label_name} saved to {csv_file}")
             else:
-                st.write(
-                    f"CSV file for {label_name} already exists. Skipping calculations."
-                )
+                # st.write(
+                #     f"CSV file for {label_name} already exists. Skipping calculations."
+                # )
+                continue
         self.save_pet_metric_combined()
         st.markdown("### Classification")
         fdg_checkbox = st.checkbox("Include FDG", value=True)
