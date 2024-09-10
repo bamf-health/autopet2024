@@ -102,6 +102,7 @@ data_dir = Path("/mnt/nfs/open_datasets/autopet2024/")
 dest_dir = Path(
     "/mnt/nfs/slow_ai_team/organ_segmentation/nnunet_liverv0.0/nnUNet_raw_database/nnUNet_raw/nnUNet_raw_data/Dataset019_AutoPET2024/"
 )
-train_df = pd.read_csv("data/train.csv")
+task = "test"
+train_df = pd.read_csv(f"data/{task}.csv")
 # create_data_folders(data_dir, dest_dir, train_df, "train")
-create_data_folders(data_dir, dest_dir, train_df, "test")
+create_data_folders(data_dir, dest_dir, train_df, task)
